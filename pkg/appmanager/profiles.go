@@ -73,7 +73,8 @@ func (appMgr *Manager) setClientSslProfile(
 	// Now handle the profile from the Route.
 	// If annotation is set, use that profile instead of Route profile.
 	if prof, ok := route.ObjectMeta.Annotations[f5ClientSslProfileAnnotation]; ok {
-		if nil != route.Spec.TLS {
+		if nil != route.Spec.TLS &&
+			"" != route.Spec.TLS.Certificate && "" != route.Spec.TLS.Key {
 			log.Infof("Both clientssl annotation and cert/key provided for Route: %s, "+
 				"using annotation.", route.ObjectMeta.Name)
 			// Delete existing Route profile if it exists
