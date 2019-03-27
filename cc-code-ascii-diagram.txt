@@ -1,0 +1,83 @@
++----------------------------------+
+|     cmd/k8s-bigip-ctlr/main.go   |
+|              main()              |
++-----+----------------------------+
+      |                                                         Write k8s ingress/configmap config to config.json
+      |                                                     +-------------------------------------------------------------+                            
+      +---------------------------------------------+       | writer/configWriter.go                                      |    process in container                  
+      | configWriter, err := writer.NewConfigWriter +------>| func NewConfigWriter()                                      |    +----------------------------+
+      +---------------------------------------------+       |     dir, err := ioutil.TempDir("", "k8s-bigip-ctlr.config") +-+  |bigipconfigdriver.py        |
+      |                                                     |        ........                                             | |  |   --config-file            |
+      |                                                     |        ......                                               | +->+     /tmp/k8s*/config.json  |
+      |                                                     |     tmpfn := filepath.Join(dir, "config.json")              | |  |                            |
+      | Start bigipconfigdriver.py to monitor config.json   +-------------------------------------------------------------+ |  +----------------------------+
+      +------------------------------------------------------------------------+     +------------------------------------+ |                              
+      | subPidCh, err := startPyhonDriver(ConfigWriter, gs, bs, *pythonBaseDir +---> |cmd/k8s-bigip-ctlr/pythonDriver.go  +-+                          
+      +------------------------------------------------------------------------+     |  startPythonDriver()               |                            
+      |                                                                              +---------------+--------------------+                            
+      |
+      |                                                      Setup appMgr vsQueue,nsQueue,configWriter, ingress/configmap/route appInformer 
+      |  Initialize appMgr                                   +-------------------------------------------------------+                                 
+      +---------------------------------------------+--+     | pkg/appmanager/appManager.go                          |                                 
+      | var appMgrParms = appmanager.Params {          |     | func NewManager(params *Params) *Manager {            |                                 
+      |    ConfigWriter: configWriter                  |     |    vsQueue := workqueue.NewNamedRateLimitingQueue()   |                                 
+      |    ........                                    +---->+    nsQueue := workqueue.NewNamedRateLimitingQueue()   |
+      | }                                              |     |    manager := Manager{                                |
+      | appMgr := appmanager.NewManager(&appMgrParms)  |     |       configWriter: params.ConfigWriter,              |
+      |                                                |     |       vsQueue: vsQueue,                               |
+      +------------------------------------------------+     |       nsQueue: nsQueue,                               |
+      |                                                      |       appInformers: make(map[string]*appInformer),    |
+      |                                                      +-------------------------------------------------------+
+      | k8s node polling                                                                                                              
+      +-------------------------------------------------------------------------------------+            
+      | err = setupNodePolling(appMgr, np, eventChan, appMgrparms.KubeClient)               |
+      | np.Run()                                                                            |                    
+      +-------------------------------------------------------------------------------------+
+      |                                                              Start appMgr namespace worker
+      | k8s namespace watching                                    +-----------------------------------------------------------+
+      +--------------------------------------+                 +->| go wait.Until(appMgr.namespaceWorker, time.Second, stopCh)|
+      | setupWatchers(appMgr, 30*time.Second)|                 |  +-----------------------------------------------------------+
+      +--------------------------------------+                 |  |
+      |                                                        |  | Start and sync ingress/configmap app informers
+      +-------------------+  +------------------------------+  |  +-----------------------------------+
+      | appMgr.Run(stopCh)+--| pkg/appmanager/appManager.go +--+->| appMgr.startAndSyncAppInformers() |
+      +-------------------+  |  Run()                       |  |  +-----------------------------------+
+      |                      |  go appMgr.runImpl(stopCh)   |  |  |
+      |                      +------------------------------+  |  |
+                                                               |  | Sync from k8s ingress/configmap and update to config.json
+                                                               |  +---------------------------------------------------------------+
+                                                               +->+ go wait.Until(appMgr.virtualServerWorker, time.Second, stopCh)|
+                                                                  +---------------------------------------------------------------+
+                                                                                     |
+                              +------------------------------------------------------+
+                              |                                                       
+      +-----------------------+------------------------+                              
+      |func (appMgr *Manager) virtualServerWorker() {  |                                                                            
+      |   for appMgr.processNextVirtualServer() {      |                                                                     
+      |   }                                            |                               
+      |}                                               |                               
+      +--+---------------------------------------------+                              
+         |                                                                            
+         +------------------------------------------------------------+               
+         | func(appMgr *Manager) processNextVirtualServer() bool {    |                                                                       
+         |     key, quit := appMgr.vsQueue.Get()                      |                                                
+         |     err := appMgr.syncVirtualServer(key.(serviceQueueKey)) |                                                                     
+         |     ................                                       |                                    
+         +--+---------------------------------------------------------+               
+            |                                                                         
+            +--------------------------------------------------------------------------------------+
+            |  func (appMgr *Manager) syncVirtualServer(skey servicequeueKey) error {              |                                                        
+            |      ........                                                                        |
+            |      err = appMgr.syncConfigMaps(&stats, sKey, rsMap, svcPortMap, svc, appInf)       |                                                           
+            |      ......                                                                          |
+            |      err = appMgr.syncIngress(&stats, sKey, rsMap, svcPortMap, svc, appInf, dgMap)   |                                                               
+            |      ......                                                                          |
+            |      err = appMgr.syncRoutes(&stats, sKey, rsMap, svcPortMap, svc, appInf, dgMap)    |                                                              
+            |      .....                                                                           |
+            |      appMgr.syncDataGroup(&stats, dbMap, sKey.Namespace)                             |                                     
+            |      appMgr.syncIRules()                                                             |     
+            |      ......                                                                          |
+            |      appMgr.deleteUnusedProfiles(appInf, sKey.Namespace, &stats)                     |                                            
+            |      ......                                                                          |
+            |      appMgr.outputConfig()                                                           |             
+            +--------------------------------------------------------------------------------------+
