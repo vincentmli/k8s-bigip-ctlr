@@ -1,0 +1,272 @@
+
+k8s flannel
+
+1 create flannel vxlan device with VNI 0 flannel.0
+
+why: 
+
+simply following "Managing BIGIP HA Clusters in OpenShift" https://clouddocs.f5.com/containers/v2/openshift/kctlr-openshift-bigip-ha.html 
+found no reason why should use VNI 0, Google search or VXLAN RFC https://tools.ietf.org/html/rfc7348 says nothing special about VNI 0
+assume using any VNI would work, but have not tested
+
+How: 
+
+In kube-flannel.yaml, add "VNI": 0 in Backend:
+
+kind: ConfigMap
+......SKIPPED....
+  net-conf.json: |
+    {
+      "Network": "10.217.0.0/16",
+      "Backend": {
+        "Type": "vxlan",
+        "VNI": 0, <--------- define VNI 
+        "Learning": true
+      }
+    }
+
+
+2 Patch flannel vxlan device flannel.0 with learning attribute
+
+Why: 
+
+Flannel creates Linux vxlan device named flannel.<VNI> on each K8S node as VXLAN endpoint, flannel hard coded vxlan device flannel.<VNI> learning attribute to false. 
+
+In general, VXLAN endpoint learns dst mac map to dst remote VXLAN endpoint through two means:
+
+a, control plain pre-populate VXLAN endpoint FDB entry
+b, data plain learning 
+
+When BIGIP HA pair is pre-populated with K8S node FDB entry after deploying CC/CIS, populated with static ARP for POD after deploying ingress/configmap, after failover happens, maybe due to inconsistency of FDB entries or static ARPs, traffic would fail to work, I have not dived into the detail reason of why traffic would fail, but this is worrisome enough for me to choose option b data plain learning, the VXLAN device learning attibute man page says here:
+
+https://www.systutorials.com/docs/linux/man/8-ip-link/
+
+[no]learning - specifies if unknown source link layer addresses and IP addresses are entered into the VXLAN device forwarding database. 
+
+and VXLAN driver https://github.com/torvalds/linux/blob/master/drivers/net/vxlan.c#L1593
+
+	if ((vxlan->cfg.flags & VXLAN_F_LEARN) &&
+	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source, ifindex, vni))
+		return false;
+
+ so for example when  K8S node VXLAN endpoint 10.169.72.127 receives packet from BIGIP flannel_vxlan endpoint 10.169.72.36 with source MAC 00:50:56:86:68:a3 and source IP 10.169.72.36, with learning attribute enabled, the node will add FDB entry like below automatically, when there is packet with destination MAC matches the FDB entry from 10.169.72.127, it will send to the dst IP 10.169.72.36, test shows same mechanism works for BIGIP, BIGIP will learn which K8S node to send the packet destinationed to the POD on that node. This should resovles the dynamics of BIGIP HA failover event.
+
+00:50:56:86:68:a3 dst 10.169.72.36 self permanent
+
+
+How:
+
+if k8s node has shipped iproute (ip link command) package with capability to enable "learning" attibute for the VXLAN flannel.<VNI> device, ip link command could be used to change the flannel.<VNI> interface. an easier solution in my opinion is to patch flannel and give flannel the option to enable "learning" attribute, a pull request has been created to coreos flannel project   
+
+https://github.com/coreos/flannel/pull/1152/files
+
+you could manually apply the patch and build the flannel image under flannel source with:
+
+make dist/flanneld
+make docker-push-all ( there maybe some build error which can be ignored if is about image registration, run docker images to see if the image is created )
+
+docker tag <impage id> <your dockerhub username>/<repo name>:<tag name>
+docker push <your dockerhub username>/<repo name>:<tag name>
+
+the patched flannel image is available here from my docker hub repo: vli39/flannel:vxlanlearning
+
+kube-flannel.yaml to pull image from my repo:
+
+
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: kube-flannel-ds
+  namespace: kube-system
+  labels:
+    tier: node
+    app: flannel
+.............CUT.......
+      initContainers:
+      - name: install-cni
+        #image: quay.io/coreos/flannel:v0.10.0-amd64
+        image: vli39/flannel:vxlanlearning <---------------
+        command:
+        - cp
+        args:
+        - -f
+        - /etc/kube-flannel/cni-conf.json
+        - /etc/cni/net.d/10-flannel.conflist
+        volumeMounts:
+        - name: cni
+          mountPath: /etc/cni/net.d
+        - name: flannel-cfg
+          mountPath: /etc/kube-flannel/
+      containers:
+      - name: kube-flannel
+        #image: quay.io/coreos/flannel:v0.10.0-amd64
+        image: vli39/flannel:vxlanlearning <--------------
+        command:
+
+
+3 add flannel.0 to container network bridge cni0
+
+Why: 
+
+when flannel.0 received the packet and decapped the packet, it does not know where it send to, add flannel.0 in container bridge cni0
+so the cni0 bridge knows which veth port send to for the POD since each POD has their veth peer in root namespace as port member of cni0
+bridge
+
+How: 
+
+on each K8S node run 'ip link set flannel.0 master cni0'
+
+cni0 bridge is only created if k8s runs with CNI and when the first POD is deployed in each node, this manual ip link command seems inconvienent, has not researched on how this can be programmed into flannel, it is worth exploring if this solutions works for users and if this turns out to be a pain point
+ 
+
+BIGIP
+
+1 no floating selfip on either physical vlan or flannel_vxlan tunnel 
+
+Why:
+
+if following OpenShift BIGIP HA, floating self ip is the local address of openshift_vxlan, and secondary address is non-floating selfip, traffic group as traffic-group-1,  but tested with flannel flannel_vxlan, for some reason K8S node flannel.0 vxlan device will not learn the packet sourcing from floating self ip and packet got dropped, no packet seen on flannel.0 interface capture, suspect floating self iphas same source MAC of flannel_vxlan interface that is already learned by K8S node flannel.0 vxlan device with source ip as non-floating self ip, tested adding MAC MASQ address to traffic-group-1, still no working, all test so far shows any packet source from floating self ip will be dropped by K8S node, thus removed all floating self ip, has not dived deeper into this on the technical root cause.  
+
+Create only non-floating self ip on BIGIP vlan and flannel_vxlan tunnel
+
+
+2 create  tunnel vxlan fl_vxlan with flooding type multipoint
+
+Why:
+
+Followed OpenShift BIGIP HA guide, assumming multipoint meaning broadcast unknown destination to all VTEP endpoint
+
+
+3 create tunnel flannel_vxlan with key 0 and local address to non-floating selfip and traffic group "traffic-group-local-only"
+
+Why:
+
+flannel_vxlan VNI key 0 should match K8S node flannel.0 VNI, only use non-floating selfip as local address, by default traffic group set to none, which does not work, not sure why, thus set to "traffic-group-local-only"
+
+4 create non-floating selfip (pod cidr range 10.217.x.x/16) with flannel_vxlan
+
+Why:
+
+see 1 
+
+5 patch CC/CIS with option to disable POD static ARP creation 
+
+
+Why:
+
+F5 official CC/CIS release only creates static ARP for POD after deploying ingress/configmap in K8S flannel VXLAN ingegration, static ARP
+uses K8S node flannel.0 vxlan device MAC address as POD MAC address, not POD own MAC address, this breaks traffic in this BIGIP HA deployment, a simple patch available to enable option to disable static ARP creation, will send a PULL request to CC/CIS team if this HA solution works
+
+
+How:
+
+in CC/CIS deployment yaml, pull the patched CC/CIS image as:
+
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+.....CUT....
+
+        - --arplearning <-----new argument to disable static ARP creation
+        - "true"
+........CUT.......
+
+image: vli39/k8s-bigip-ctlr:demo <------patched image
+
+or you could build your own CC/CIS image after manually apply the diff:
+
+https://github.com/F5Networks/k8s-bigip-ctlr/pull/952/files
+
+
++----------------------------------+---------------------------------------------------------------------------------------------------+
+|  mgmt network 10.3.72.x/16                                                                                                           |
+|  vlan/underlay network 10.169.72.x/16                                                                                                |
+|  vxlan/overlay network 10.217.x.x/16                                                                                                 |
+|                                                                                                                                      |
+|                                     [root@vli-k8s-bigip-2:Active:Changes Pending] config # tmsh show net arp    |
+|                                                                                                                                      |
+|                                      ----------------------------------------------------------------------------------------------- |
+|                                      Net::Arp                                                                                        |
+|                                      Name           Address        HWaddress          Vlan                   Expire-in-sec  Status   |
+|                                      ----------------------------------------------------------------------------------------------- |
+|                                      10.169.72.36   10.169.72.36   00:50:56:86:30:74  /Common/vli-169        110            resolved |
+|                                      10.169.72.127  10.169.72.127  00:50:56:86:0b:ae  /Common/vli-169        234            resolved |
+|                                      10.169.72.128  10.169.72.128  00:50:56:86:48:98  /Common/vli-169        234            resolved |
+|                                      10.217.0.22    10.217.0.22    0a:58:0a:d9:00:16  /Common/flannel_vxlan  294            resolved |
+|                                      10.217.1.30    10.217.1.30    0a:58:0a:d9:01:1e  /Common/flannel_vxlan  234            resolved |
+|                                                                                                                                      |
+|                                      [root@vli-k8s-bigip-2:Active:Changes Pending] config # tmsh show net fdb                        |
+|                                                                                                                                      |
+|                                      -------------------------------------------------------------------                             |
+|                                      Net::FDB                                                                                        |
+|                                      Tunnel         Mac Address        Member                    Dynamic                             |
+|                                      -------------------------------------------------------------------                             |
+|                                      flannel_vxlan  ae:de:d6:ee:15:ab  endpoint:10.169.72.127%0  no                                  |
+|                                      flannel_vxlan  fa:41:fe:3f:5c:4d  endpoint:10.169.72.128%0  no                                  |
+|                                      flannel_vxlan  0a:58:0a:d9:00:16  endpoint:10.169.72.127    yes                                 |
+|                                      flannel_vxlan  0a:58:0a:d9:01:1e  endpoint:10.169.72.128    yes                                 |
+|                                                                                                                                      |
+|                                                                                                                                      |
+|                                                                                                                                      |
+|    VE BIGIP-1    10.217.31.x/16                                             VE BIGIP-2 (Active) 10.217.33.x/16                       |
+|  +------------------------------------------------+                        +-------------------------------------------------+       |
+|  |     net self 10.217.31.36 {                    |                        |  net self 10.217.33.38 {                        |       |
+|  |         address 10.217.31.36/16                |                        |     address 10.217.33.38/16                     |       |
+|  |         traffic-group traffic-group-local-only |                        |     traffic-group traffic-group-local-only      |       |
+|  |         vlan flannel_vxlan                     |                        |     vlan flannel_vxlan                          |       |
+|  |     }                                          |                        |  }                                              |       |
+|  |     net self 10.169.72.36 {                    |                        |  net self 10.169.72.38 {                        |       |
+|  |         address 10.169.72.36/16                |                        |      address 10.169.72.38/16                    |       |
+|  |         traffic-group traffic-group-local-only |                        |      traffic-group traffic-group-local-only     |       |
+|  |         vlan vli-169                           | no config sync         |      vlan vli-169                               |       |
+|  |                                                | HA Failover            |                                                 |       |
+|  |     }                                          | through mgmt network   |  }                                              |       |
+|  |    net vlan vli-169 {                          +------------------------+  net vlan vli-169 {                             |       |
+|  |     tag 169                                    |                        |      tag 169                                    |       |
+|  |    }                                           |                        |  }                                              |       |
+|  |    net tunnels vxlan fl-vxlan {                |                        |  net tunnels vxlan fl-vxlan {                   |       |
+|  |     flooding-type multipoint                   |                        |      flooding-type multipoint                   |       |
+|  |    }                                           |                        |  }                                              |       |
+|  |    net tunnels tunnel flannel_vxlan{ MAC 68:a3 |                        |  net tunnels tunnel flannel_vxlan { MAC 78:2d   |       |
+|  |     local-address 10.169.72.36                 |                        |      local-address 10.169.72.38                 |       |
+|  |     profile fl-vxlan                           |                        |      profile fl-vxlan                           |       |
+|  |     key 0                                      |                        |      key 0                                      |       |
+|  |     traffic-group traffic-group-local-only     |                        |      traffic-group traffic-group-local-only     |       |
+|  |    }                                           |                        |  }                                              |       |
+|  +------------------+-----------------------------+                        +-----------------+-------------------------------+       |
+|                     |vlan vli-169 10.169.72.36                                               | vlan vli-169 10.169.72.38             |
+|                     +--------------underlay--encap-------+------underlay-----encap-----------+                                       |
+|                                                          |                                                                           |
+|                                                          |                                                                           |
+|                      +-------------underlay--encap-------+------underlay-----encap-----------+                                       |
+|                      |                                                                       | K8S WORKER NODE 10.169.72.128         |
+|      K8S MASTER NODE | 10.169.72.127                                                         |                                       |
+|  +------------------ens192--------------------------+                      +-----------------ens192----------------------------+     |
+|  |                    | encap                       |                      |                 | encap                           |     |
+|  |             +------+--------------------------+  |                      |              +--+----------------------------+    |     |
+|  |             | flannel.0: mtu 1450 master cni0 |  |                      |        +-----+flannel.0: mtu 1450 master cni0|    |     |
+|  |        +----+ vxlan id 0 local 10.169.72.127  |  |                      |  decap |     |vxlan id 0 local 10.169.72.128 |    |     |
+|  |        |    +--------15:ab--------------------+  |                      |        |     +--------5c:4d------------------+    |     |
+|  |        | decap                                   |                      |        |                                          |     |
+|  | +------+-----+----------------------+            |                      | +------+----------------------------+             |     |
+|  | |cni0 bridge forward decapped packet|            |                      | |cni0 bridge forward decapped packet|             |     |
+|  | +-----------------------------------+            |                      | +-------+---------------------------+             |     |
+|  |       |                                          |                      |         |                                         |     |
+|  |       |   POD CIDR 10.217.0.x/24                 |                      |         |  POD CIDR 10.217.1.x/24                 |     |
+|  |    +--+---------------+-------------+            |                      |   +-----+----------+---------------+              |     |
+|  |    |                  |             |            |                      |   |                |               |              |     |
+|  |    | .22              |             |            |                      |   | .30            |               |              |     |
+|  |   +-----------+  +---+--------+  +--+------+     |                      | +-+-------+   +----+------+  +-----+------+       |     |
+|  |   | nginx pod |  | cc/cis pod |  | flannel |     |                      | |nginx pod|   |cc/cis pod |  |flannel pod |       |     |
+|  |   +-----------+  +------------+  +---------+     |                      | +---------+   +-----------+  +------------+       |     |
+|  |        00:16                                     |                      |    01:1e                                          |     |
+|  +--------------------------------------------------+                      +---------------------------------------------------+     |
+|   bridge fdb show dev flannel.0                                              bridge fdb show dev flannel.0                           |
+|      00:50:56:86:78:2d dst 10.169.72.38 self permanent                        00:50:56:86:78:2d dst 10.169.72.38 self permanent      |
+|      fa:41:fe:3f:5c:4d dst 10.169.72.128 self permanent                       00:50:56:86:68:a3 dst 10.169.72.36 self permanent      |
+|      00:50:56:86:68:a3 dst 10.169.72.36 self permanent                        ae:de:d6:ee:15:ab dst 10.169.72.127 self permanent     |
+|                                                                                                                                      |
+|                                                                                                                                      |
++--------------------------------------------------------------------------------------------------------------------------------------+
+
+

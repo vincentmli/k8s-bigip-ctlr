@@ -1,0 +1,40 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: single-service
+  annotations:
+     ingress.kubernetes.io/ssl-redirect: "false"
+     ingress.kubernetes.io/allow-http: "true"
+     ingress.kubernetes.io/allow-https: "true"
+     kubernetes.io/ingress.class: f5
+     'virtual-server.f5.com/ip': '10.169.72.166'
+     #'virtual-server.f5.com/http-port': '8080'
+#     'virtual-server.f5.com/health': |
+#      [
+#        {
+#          "path":     "www.example.com/",
+#          "send":     "GET / HTTP/1.1\\r\\nHost: www.example.com\\r\\nConnection: Close\\r\\n\\r\\n",
+#          "interval": 5,
+#          "timeout":  10
+#        }
+#      ]
+spec:
+  tls:
+  - hosts:
+    - www.example.com
+    secretName: Common/clientssl
+  rules:
+   - host: www.example.com
+     http:
+       paths:
+       - path: /  
+         backend:
+            serviceName: nginxservice 
+            servicePort: 80
+   - host: www1.example.com
+     http:
+       paths:
+       - path: /  
+         backend:
+            serviceName: nginxservice1 
+            servicePort: 80
