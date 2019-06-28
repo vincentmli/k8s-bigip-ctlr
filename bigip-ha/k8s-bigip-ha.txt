@@ -5,7 +5,7 @@ k8s flannel
 
 why: 
 
-simply following "Managing BIGIP HA Clusters in OpenShift" https://clouddocs.f5.com/containers/v2/openshift/kctlr-openshift-bigip-ha.html 
+simply following "Managing BIGIP HA Clusters in OpenShift" https://clouddocs.f5.com/containers/v2/openshift/kctlr-openshift-bigip-ha.html
 found no reason why should use VNI 0, Google search or VXLAN RFC https://tools.ietf.org/html/rfc7348 says nothing special about VNI 0
 assume using any VNI would work, but have not tested
 
@@ -30,14 +30,18 @@ kind: ConfigMap
 
 Why: 
 
-Flannel creates Linux vxlan device named flannel.<VNI> on each K8S node as VXLAN endpoint, flannel hard coded vxlan device flannel.<VNI> learning attribute to false. 
+Flannel creates Linux vxlan device named flannel.<VNI> on each K8S node as VXLAN endpoint, 
+flannel hard coded vxlan device flannel.<VNI> learning attribute to false. 
 
 In general, VXLAN endpoint learns dst mac map to dst remote VXLAN endpoint through two means:
 
 a, control plain pre-populate VXLAN endpoint FDB entry
 b, data plain learning 
 
-When BIGIP HA pair is pre-populated with K8S node FDB entry after deploying CC/CIS, populated with static ARP for POD after deploying ingress/configmap, after failover happens, maybe due to inconsistency of FDB entries or static ARPs, traffic would fail to work, I have not dived into the detail reason of why traffic would fail, but this is worrisome enough for me to choose option b data plain learning, the VXLAN device learning attibute man page says here:
+When BIGIP HA pair is pre-populated with K8S node FDB entry after deploying CC/CIS, populated with static ARP for POD after deploying 
+ingress/configmap, after failover happens, maybe due to inconsistency of FDB entries or static ARPs, traffic would fail to work,
+I have not dived into the detail reason of why traffic would fail, but this is worrisome enough for me to choose option b 
+data plain learning, the VXLAN device learning attibute man page says here:
 
 https://www.systutorials.com/docs/linux/man/8-ip-link/
 
@@ -49,21 +53,29 @@ and VXLAN driver https://github.com/torvalds/linux/blob/master/drivers/net/vxlan
 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source, ifindex, vni))
 		return false;
 
- so for example when  K8S node VXLAN endpoint 10.169.72.127 receives packet from BIGIP flannel_vxlan endpoint 10.169.72.36 with source MAC 00:50:56:86:68:a3 and source IP 10.169.72.36, with learning attribute enabled, the node will add FDB entry like below automatically, when there is packet with destination MAC matches the FDB entry from 10.169.72.127, it will send to the dst IP 10.169.72.36, test shows same mechanism works for BIGIP, BIGIP will learn which K8S node to send the packet destinationed to the POD on that node. This should resovles the dynamics of BIGIP HA failover event.
+so for example when  K8S node VXLAN endpoint 10.169.72.127 receives packet from BIGIP flannel_vxlan endpoint 10.169.72.36 with source MAC
+
+ 00:50:56:86:68:a3 and source IP 10.169.72.36, with learning attribute enabled, the node will add FDB entry like below automatically, 
+when there is packet with destination MAC matches the FDB entry from 10.169.72.127, it will send to the dst IP 10.169.72.36, 
+test shows same mechanism works for BIGIP, BIGIP will learn which K8S node to send the packet destinationed to the POD on that node. 
+This should resovles the dynamics of BIGIP HA failover event.
 
 00:50:56:86:68:a3 dst 10.169.72.36 self permanent
 
 
 How:
 
-if k8s node has shipped iproute (ip link command) package with capability to enable "learning" attibute for the VXLAN flannel.<VNI> device, ip link command could be used to change the flannel.<VNI> interface. an easier solution in my opinion is to patch flannel and give flannel the option to enable "learning" attribute, a pull request has been created to coreos flannel project   
+if k8s node has shipped iproute (ip link command) package with capability to enable "learning" attibute for the VXLAN flannel.<VNI> 
+device, ip link command could be used to change the flannel.<VNI> interface. an easier solution in my opinion is to patch flannel 
+and give flannel the option to enable "learning" attribute, a pull request has been created to coreos flannel project   
 
 https://github.com/coreos/flannel/pull/1152/files
 
 you could manually apply the patch and build the flannel image under flannel source with:
 
 make dist/flanneld
-make docker-push-all ( there maybe some build error which can be ignored if is about image registration, run docker images to see if the image is created )
+make docker-push-all 
+( there maybe some build error which can be ignored if is about image registration, run docker images to see if the image is created )
 
 docker tag <impage id> <your dockerhub username>/<repo name>:<tag name>
 docker push <your dockerhub username>/<repo name>:<tag name>
@@ -108,15 +120,17 @@ metadata:
 
 Why: 
 
-when flannel.0 received the packet and decapped the packet, it does not know where it send to, add flannel.0 in container bridge cni0
-so the cni0 bridge knows which veth port send to for the POD since each POD has their veth peer in root namespace as port member of cni0
-bridge
+when flannel.0 received the packet and decapped the packet, it does not know where it send to, add flannel.0 in container bridge 
+cni0 so the cni0 bridge knows which veth port send to for the POD since each POD has their veth peer in root namespace as 
+port member of cni0 bridge
 
 How: 
 
 on each K8S node run 'ip link set flannel.0 master cni0'
 
-cni0 bridge is only created if k8s runs with CNI and when the first POD is deployed in each node, this manual ip link command seems inconvienent, has not researched on how this can be programmed into flannel, it is worth exploring if this solutions works for users and if this turns out to be a pain point
+cni0 bridge is only created if k8s runs with CNI and when the first POD is deployed in each node, this manual ip link command 
+seems inconvienent, has not researched on how this can be programmed into flannel, it is worth exploring if this solutions works 
+for users and if this turns out to be a pain point
  
 
 BIGIP
@@ -125,7 +139,13 @@ BIGIP
 
 Why:
 
-if following OpenShift BIGIP HA, floating self ip is the local address of openshift_vxlan, and secondary address is non-floating selfip, traffic group as traffic-group-1,  but tested with flannel flannel_vxlan, for some reason K8S node flannel.0 vxlan device will not learn the packet sourcing from floating self ip and packet got dropped, no packet seen on flannel.0 interface capture, suspect floating self iphas same source MAC of flannel_vxlan interface that is already learned by K8S node flannel.0 vxlan device with source ip as non-floating self ip, tested adding MAC MASQ address to traffic-group-1, still no working, all test so far shows any packet source from floating self ip will be dropped by K8S node, thus removed all floating self ip, has not dived deeper into this on the technical root cause.  
+if following OpenShift BIGIP HA, floating self ip is the local address of openshift_vxlan, and secondary address is 
+non-floating selfip, traffic group as traffic-group-1,  but tested with flannel flannel_vxlan, for some reason K8S node 
+flannel.0 vxlan device will not learn the packet sourcing from floating self ip and packet got dropped, no packet seen 
+on flannel.0 interface capture, suspect floating self iphas same source MAC of flannel_vxlan interface that is already 
+learned by K8S node flannel.0 vxlan device with source ip as non-floating self ip, tested adding MAC MASQ address to
+traffic-group-1, still no working, all test so far shows any packet source from floating self ip will be dropped 
+by K8S node, thus removed all floating self ip, has not dived deeper into this on the technical root cause.  
 
 Create only non-floating self ip on BIGIP vlan and flannel_vxlan tunnel
 
@@ -141,7 +161,8 @@ Followed OpenShift BIGIP HA guide, assumming multipoint meaning broadcast unknow
 
 Why:
 
-flannel_vxlan VNI key 0 should match K8S node flannel.0 VNI, only use non-floating selfip as local address, by default traffic group set to none, which does not work, not sure why, thus set to "traffic-group-local-only"
+flannel_vxlan VNI key 0 should match K8S node flannel.0 VNI, only use non-floating selfip as local address, 
+by default traffic group set to none, which does not work, not sure why, thus set to "traffic-group-local-only"
 
 4 create non-floating selfip (pod cidr range 10.217.x.x/16) with flannel_vxlan
 
@@ -154,8 +175,10 @@ see 1
 
 Why:
 
-F5 official CC/CIS release only creates static ARP for POD after deploying ingress/configmap in K8S flannel VXLAN ingegration, static ARP
-uses K8S node flannel.0 vxlan device MAC address as POD MAC address, not POD own MAC address, this breaks traffic in this BIGIP HA deployment, a simple patch available to enable option to disable static ARP creation, will send a PULL request to CC/CIS team if this HA solution works
+F5 official CC/CIS release only creates static ARP for POD after deploying ingress/configmap in K8S flannel VXLAN ingegration, 
+static ARP uses K8S node flannel.0 vxlan device MAC address as POD MAC address, not POD own MAC address, 
+this breaks traffic in this BIGIP HA deployment, a simple patch available to enable option to disable static ARP creation, 
+will send a PULL request to CC/CIS team if this HA solution works
 
 
 How:
