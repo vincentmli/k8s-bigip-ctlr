@@ -53,15 +53,33 @@ and VXLAN driver https://github.com/torvalds/linux/blob/master/drivers/net/vxlan
 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source, ifindex, vni))
 		return false;
 
-so for example when  K8S node VXLAN endpoint 10.169.72.127 receives packet from BIGIP flannel_vxlan endpoint 10.169.72.36 with source MAC
+Actually flannel would create the FDB on K8S node as log below shown for each K8S node VTEP including BIGIP fake node, this explains
+why floating selfip has no FDB record on K8s node because there is no "fake" node VTEP for BIGIP floating selfip, this may also explain
+why packet from floating selfip get dropped at K8S node. the kernel vxlan driver vxlan_snoop presumably should still add the FDB 
+for each VTEP endpoint when "learning" attribute is enabled, but if there is already FDB record created by flannel, recreating the FDB
+record does not create duplicate FDB record, then why bother to enable "learning" attribute for flannel VXLAN device since flannel
+already does the job for K8S node? lab test shows without "learning" attribute on VXLAN device "flannel.<VNI>", the BIGIP would fail
+to resolve ARP for K8S POD through ARP request mechanism, it appears "learning" attribute has something to do with ARP too, not just
+FDB, need to research on this more. 
 
- 00:50:56:86:68:a3 and source IP 10.169.72.36, with learning attribute enabled, the node will add FDB entry like below automatically, 
-when there is packet with destination MAC matches the FDB entry from 10.169.72.127, it will send to the dst IP 10.169.72.36, 
-test shows same mechanism works for BIGIP, BIGIP will learn which K8S node to send the packet destinationed to the POD on that node. 
-This should resovles the dynamics of BIGIP HA failover event.
+I0626 04:25:14.061943       1 vxlan_network.go:60] watching for new subnet leases
+I0626 04:25:14.062010       1 vxlan_network.go:138] adding subnet: 10.217.31.0/24 PublicIP: 10.169.72.36 VtepMAC: 00:50:56:86:68:a3
+I0626 04:25:14.062035       1 device.go:157] calling AddARP: 10.217.31.0, 00:50:56:86:68:a3
+I0626 04:25:14.062118       1 device.go:134] calling AddFDB: 10.169.72.36, 00:50:56:86:68:a3
 
-00:50:56:86:68:a3 dst 10.169.72.36 self permanent
+I0626 04:25:14.062292       1 vxlan_network.go:138] adding subnet: 10.217.33.0/24 PublicIP: 10.169.72.38 VtepMAC: 00:50:56:86:78:2d
+I0626 04:25:14.062309       1 device.go:157] calling AddARP: 10.217.33.0, 00:50:56:86:78:2d
+I0626 04:25:14.062376       1 device.go:134] calling AddFDB: 10.169.72.38, 00:50:56:86:78:2d
 
+I0626 04:25:14.085696       1 vxlan_network.go:138] adding subnet: 10.217.0.0/24 PublicIP: 10.169.72.127 VtepMAC: ae:de:d6:ee:15:ab
+I0626 04:25:14.085737       1 device.go:157] calling AddARP: 10.217.0.0, ae:de:d6:ee:15:ab
+I0626 04:25:14.085813       1 device.go:134] calling AddFDB: 10.169.72.127, ae:de:d6:ee:15:ab
+
+
+bridge fdb show dev flannel.0                           
+    00:50:56:86:78:2d dst 10.169.72.38 self permanent      
+    00:50:56:86:68:a3 dst 10.169.72.36 self permanent      
+    ae:de:d6:ee:15:ab dst 10.169.72.127 self permanent     
 
 How:
 
