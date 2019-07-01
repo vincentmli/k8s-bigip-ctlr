@@ -1,0 +1,284 @@
+1 configure two BIGIP as HA pair as usual, but without floating selfip on underlay vlan vli-169
+
+2 add two BIGIP node to k8s (note no floating selfip on tunnel flannel_vxlan):
+
+repeat following for another BIGIP node with self self ip 10.169.72.38
+
+on BIGIP with non floating selfip 10.169.72.36 
+
+tmsh create net tunnels vxlan fl-vxlan port 8472 flooding-type none
+
+tmsh create net tunnels tunnel flannel_vxlan key 1 profile fl-vxlan local-address 10.169.72.36 
+
+tmsh create net self 10.217.31.36 address 10.217.31.36/16 allow-service none vlan flannel_vxlan
+
+find the MAC of flannel_vxlan as VtepMAC
+
+fake k8s bigip node bigip-10-169-72-36 bigip-node-10.169.72.36.yaml
+
+apiVersion: v1
+kind: Node
+metadata:
+  name: bigip-10-169-72-36
+  annotations:
+    # This is the MAC address of the VXLAN tunnel you have created on the
+    # BIG-IP device
+    flannel.alpha.coreos.com/backend-data: '{"VtepMAC":"00:50:56:86:68:a3"}'
+    flannel.alpha.coreos.com/backend-type: "vxlan"
+    flannel.alpha.coreos.com/kube-subnet-manager: "true"
+    # This address is the BIG-IP VTEP (internal address) in the Flannel VXLAN
+    flannel.alpha.coreos.com/public-ip: 10.169.72.36
+spec:
+  # This defines the Flannel subnet for the BIG-IP device. Be sure this subnet
+  # does not collide with the subnets of the other Nodes. The BIG-IP device's
+  # self-ip address will be defined in this subnet.
+  podCIDR: 10.217.31.0/24
+
+fake k8s bigip node bigip-10-169-72-38 bigip-node-10.169.72.38.yaml
+
+apiVersion: v1
+kind: Node
+metadata:
+  name: bigip-10-169-72-38
+  annotations:
+    # This is the MAC address of the VXLAN tunnel you have created on the
+    # BIG-IP device
+    flannel.alpha.coreos.com/backend-data: '{"VtepMAC":"00:50:56:86:78:2d"}'
+    flannel.alpha.coreos.com/backend-type: "vxlan"
+    flannel.alpha.coreos.com/kube-subnet-manager: "true"
+    # This address is the BIG-IP VTEP (internal address) in the Flannel VXLAN
+    flannel.alpha.coreos.com/public-ip: 10.169.72.38
+spec:
+  # This defines the Flannel subnet for the BIG-IP device. Be sure this subnet
+  # does not collide with the subnets of the other Nodes. The BIG-IP device's
+  # self-ip address will be defined in this subnet.
+  podCIDR: 10.217.33.0/24
+
+
+kubectl apply -f bigip-node-10.169.72.36.yaml
+kubectl apply -f bigip-node-10.169.72.38.yaml
+
+3 deploy cc/cis for each BIGIP
+
+cc-10.169.72.36.yaml
+
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+  labels:
+    app: cc-36
+  name: cc-36
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cc-36
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cc-36
+    spec:
+      #hostNetwork: true
+      serviceAccountName: bigip-ctlr-serviceaccount
+      containers:
+      - args:
+        - --bigip-partition
+        - k8s
+        - --bigip-url
+        - 10.169.72.36
+        - --bigip-username
+        - admin
+        - --bigip-password
+        - admin
+        - --verify-interval
+        - "30"
+        - --namespace
+        - default
+        - --node-poll-interval
+        - "1"
+        - --pool-member-type
+        - cluster
+        - --flannel-name
+        - flannel_vxlan
+        - --log-level
+        - DEBUG
+        - --insecure
+        - "true"
+        command:
+        - /app/bin/k8s-bigip-ctlr
+        image: f5networks/k8s-bigip-ctlr:1.9.1
+        imagePullPolicy: Always
+        name: cc-36
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128M
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+
+cc-10.169.72.38.yaml
+
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+  labels:
+    app: cc-38
+  name: cc-38
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cc-38
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cc-38
+    spec:
+      #hostNetwork: true
+      serviceAccountName: bigip-ctlr-serviceaccount
+      containers:
+      - args:
+        - --bigip-partition
+        - k8s
+        - --bigip-url
+        - 10.169.72.38
+        - --bigip-username
+        - admin
+        - --bigip-password
+        - admin
+        - --verify-interval
+        - "30"
+        - --namespace
+        - default
+        - --node-poll-interval
+        - "1"
+        - --pool-member-type
+        - cluster
+        - --flannel-name
+        - flannel_vxlan
+        - --log-level
+        - DEBUG
+        - --insecure
+        - "true"
+        command:
+        - /app/bin/k8s-bigip-ctlr
+        image: f5networks/k8s-bigip-ctlr:1.9.1
+        imagePullPolicy: Always
+        name: cc-38
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128M
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+
+kubectl apply -f cc-10.169.72.36.yaml
+kubectl apply -f cc-10.169.72.38.yaml
+
+
++----------------------------------+---------------------------------------------------------------------------------------------------+
+|  mgmt network 10.3.72.x/16                                                                                                           |
+|  vlan/underlay network 10.169.72.x/16                                                                                                |
+|  vxlan/overlay network 10.217.x.x/16                                                                                                 |
+|                                                                                                                                      |
+|        [root@vli-k8s-bigip-2:Active:Changes Pending] config # tmsh show net arp                                                      |
+|                                                                                                                                      |
+|        -----------------------------------------------------------------------------------------------                               |
+|        Net::Arp                                                                                                                      |
+|        Name                       Address        HWaddress          Vlan                   Expire-in-sec  Status                     |
+|        -----------------------------------------------------------------------------------------------                               |
+|        10.169.72.36               10.169.72.36   00:50:56:86:30:74  /Common/vli-169        110            resolved                   |
+|        10.169.72.127              10.169.72.127  00:50:56:86:0b:ae  /Common/vli-169        234            resolved                   |
+|        10.169.72.128              10.169.72.128  00:50:56:86:48:98  /Common/vli-169        234            resolved                   |
+|        /Common/k8s-10.217.0.25    10.217.0.22    66:a2:ef:2f:ad:7c  -                      -              static                     |
+|        /Common/k8s-10.217.1.43    10.217.1.43    f6:b1:40:d9:e3:41  -                      -              static                     |
+|                                                                                                                                      |
+|        [root@vli-k8s-bigip-2:Active:Changes Pending] config # tmsh show net fdb                                                      |
+|                                                                                                                                      |
+|        -------------------------------------------------------------------                                                           |
+|        Net::FDB                                                                                                                      |
+|        Tunnel         Mac Address        Member                    Dynamic                                                           |
+|        -------------------------------------------------------------------                                                           |
+|        flannel_vxlan  ae:de:d6:ee:15:ab  endpoint:10.169.72.127%0  no                                                                |
+|        flannel_vxlan  fa:41:fe:3f:5c:4d  endpoint:10.169.72.128%0  no                                                                |
+|                                                                                                                                      |
+|                                                                                                                                      |
+|                                                                                                                                      |
+|    VE BIGIP-1    10.217.31.x/16                                             VE BIGIP-2 (Active) 10.217.33.x/16                       |
+|  +------------------------------------------------+                        +-------------------------------------------------+       |
+|  |     net self 10.217.31.36 {                    |                        |  net self 10.217.33.38 {                        |       |
+|  |         address 10.217.31.36/16                |                        |     address 10.217.33.38/16                     |       |
+|  |         traffic-group traffic-group-local-only |                        |     traffic-group traffic-group-local-only      |       |
+|  |         vlan flannel_vxlan                     |                        |     vlan flannel_vxlan                          |       |
+|  |     }                                          |                        |  }                                              |       |
+|  |     net self 10.169.72.36 {                    |                        |  net self 10.169.72.38 {                        |       |
+|  |         address 10.169.72.36/16                |                        |      address 10.169.72.38/16                    |       |
+|  |         traffic-group traffic-group-local-only |                        |      traffic-group traffic-group-local-only     |       |
+|  |         vlan vli-169                           | no config sync         |      vlan vli-169                               |       |
+|  |                                                | HA Failover            |                                                 |       |
+|  |     }                                          | through mgmt network   |  }                                              |       |
+|  |    net vlan vli-169 {                          +------------------------+  net vlan vli-169 {                             |       |
+|  |     tag 169                                    |                        |      tag 169                                    |       |
+|  |    }                                           |                        |  }                                              |       |
+|  |    net tunnels vxlan fl-vxlan {                |                        |  net tunnels vxlan fl-vxlan {                   |       |
+|  |     flooding-type none                         |                        |      flooding-type multipoint                   |       |
+|  |    }                                           |                        |  }                                              |       |
+|  |    net tunnels tunnel flannel_vxlan{ MAC 68:a3 |                        |  net tunnels tunnel flannel_vxlan { MAC 78:2d   |       |
+|  |     local-address 10.169.72.36                 |                        |      local-address 10.169.72.38                 |       |
+|  |     profile fl-vxlan                           |                        |      profile fl-vxlan                           |       |
+|  |     key 1                                      |                        |      key 1                                      |       |
+|  |     traffic-group none                         |                        |      traffic-group none                         |       |
+|  |    }                                           |                        |  }                                              |       |
+|  +------------------+-----------------------------+                        +-----------------+-------------------------------+       |
+|                     |vlan vli-169 10.169.72.36                                               | vlan vli-169 10.169.72.38             |
+|                     +--------------underlay--encap-------+------underlay-----encap-----------+                                       |
+|                                                          |                                                                           |
+|                                                          |                                                                           |
+|                      +-------------underlay--encap-------+------underlay-----encap-----------+                                       |
+|                      |                                                                       | K8S WORKER NODE 10.169.72.128         |
+|      K8S MASTER NODE | 10.169.72.127                                                         |                                       |
+|  +------------------ens192--------------------------+                      +-----------------ens192----------------------------+     |
+|  |                    | encap                       |                      |                 | encap                           |     |
+|  |             +------+--------------------------+  |                      |              +--+----------------------------+    |     |
+|  |             | flannel.0: mtu 1450 master cni0 |  |                      |        +-----+flannel.0: mtu 1450 master cni0|    |     |
+|  |        +----+ vxlan id 0 local 10.169.72.127  |  |                      |  decap |     |vxlan id 0 local 10.169.72.128 |    |     |
+|  |        |    +--------15:ab--------------------+  |                      |        |     +--------5c:4d------------------+    |     |
+|  |        | decap                                   |                      |        |                                          |     |
+|  | +------+-----+----------------------+            |                      | +------+----------------------------+             |     |
+|  | |cni0 bridge forward decapped packet|            |                      | |cni0 bridge forward decapped packet|             |     |
+|  | +-----------------------------------+            |                      | +-------+---------------------------+             |     |
+|  |       |                                          |                      |         |                                         |     |
+|  |       |   POD CIDR 10.217.0.x/24                 |                      |         |  POD CIDR 10.217.1.x/24                 |     |
+|  |    +--+---------------+-------------+            |                      |   +-----+----------+---------------+              |     |
+|  |    |                  |             |            |                      |   |                |               |              |     |
+|  |    | .25              |             |            |                      |   | .43            |               |              |     |
+|  |   +-----------+  +---+--------+  +--+------+     |                      | +-+-------+   +----+------+  +-----+------+       |     |
+|  |   | nginx pod |  | cc/cis pod |  | flannel |     |                      | |nginx pod|   |cc/cis pod |  |flannel pod |       |     |
+|  |   +-----------+  +------------+  +---------+     |                      | +---------+   +-----------+  +------------+       |     |
+|  |        ad:7c                                     |                      |    5c:4d                                          |     |
+|  +--------------------------------------------------+                      +---------------------------------------------------+     |
+|   bridge fdb show dev flannel.0                                              bridge fdb show dev flannel.0                           |
+|      00:50:56:86:78:2d dst 10.169.72.38 self permanent                        00:50:56:86:78:2d dst 10.169.72.38 self permanent      |
+|      fa:41:fe:3f:5c:4d dst 10.169.72.128 self permanent                       00:50:56:86:68:a3 dst 10.169.72.36 self permanent      |
+|      00:50:56:86:68:a3 dst 10.169.72.36 self permanent                        ae:de:d6:ee:15:ab dst 10.169.72.127 self permanent     |
+|                                                                                                                                      |
+|                                                                                                                                      |
++--------------------------------------------------------------------------------------------------------------------------------------+
+
+
